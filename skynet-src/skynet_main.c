@@ -3,6 +3,7 @@
 #include "skynet_imp.h"
 #include "skynet_env.h"
 #include "skynet_server.h"
+#include "luashrtbl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,6 +106,8 @@ main(int argc, char *argv[]) {
 			"usage: skynet configfilename\n");
 		return 1;
 	}
+
+	luaS_initshr();
 	skynet_globalinit();
 	skynet_env_init();
 
@@ -112,7 +115,7 @@ main(int argc, char *argv[]) {
 
 	struct skynet_config config;
 
-	struct lua_State *L = lua_newstate(skynet_lalloc, NULL);
+	struct lua_State *L = luaL_newstate();
 	luaL_openlibs(L);	// link lua lib
 
 	int err = luaL_loadstring(L, load_config);
@@ -139,6 +142,7 @@ main(int argc, char *argv[]) {
 
 	skynet_start(&config);
 	skynet_globalexit();
+	luaS_exitshr();
 
 	return 0;
 }

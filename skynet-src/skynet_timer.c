@@ -4,6 +4,7 @@
 #include "skynet_mq.h"
 #include "skynet_server.h"
 #include "skynet_handle.h"
+#include "spinlock.h"
 
 #include <time.h>
 #include <assert.h>
@@ -16,9 +17,6 @@
 #endif
 
 typedef void (*timer_execute_func)(void *ud,void *arg);
-
-#define LOCK(q) while (__sync_lock_test_and_set(&(q)->lock,1)) {}
-#define UNLOCK(q) __sync_lock_release(&(q)->lock);
 
 #define TIME_NEAR_SHIFT 8
 #define TIME_NEAR (1 << TIME_NEAR_SHIFT)
@@ -45,12 +43,11 @@ struct link_list {
 struct timer {
 	struct link_list near[TIME_NEAR];
 	struct link_list t[4][TIME_LEVEL];
-	int lock;
+	struct spinlock lock;
 	uint32_t time;
-	uint32_t current;
 	uint32_t starttime;
+	uint64_t current;
 	uint64_t current_point;
-	uint64_t origin_point;
 };
 
 static struct timer * TI = NULL;
@@ -97,12 +94,12 @@ timer_add(struct timer *T,void *arg,size_t sz,int time) {
 	struct timer_node *node = (struct timer_node *)skynet_malloc(sizeof(*node)+sz);
 	memcpy(node+1,arg,sz);
 
-	LOCK(T);
+	SPIN_LOCK(T);
 
 		node->expire=time+T->time;
 		add_node(T,node);
 
-	UNLOCK(T);
+	SPIN_UNLOCK(T);
 }
 
 static void
@@ -146,7 +143,7 @@ dispatch_list(struct timer_node *current) {
 		message.source = 0;
 		message.session = event->session;
 		message.data = NULL;
-		message.sz = PTYPE_RESPONSE << HANDLE_REMOTE_SHIFT;
+		message.sz = (size_t)PTYPE_RESPONSE << MESSAGE_TYPE_SHIFT;
 
 		skynet_context_push(event->handle, &message);
 		
@@ -162,16 +159,16 @@ timer_execute(struct timer *T) {
 	
 	while (T->near[idx].head.next) {
 		struct timer_node *current = link_clear(&T->near[idx]);
-		UNLOCK(T);
+		SPIN_UNLOCK(T);
 		// dispatch_list don't need lock T
 		dispatch_list(current);
-		LOCK(T);
+		SPIN_LOCK(T);
 	}
 }
 
 static void 
 timer_update(struct timer *T) {
-	LOCK(T);
+	SPIN_LOCK(T);
 
 	// try to dispatch timeout 0 (rare condition)
 	timer_execute(T);
@@ -181,7 +178,7 @@ timer_update(struct timer *T) {
 
 	timer_execute(T);
 
-	UNLOCK(T);
+	SPIN_UNLOCK(T);
 }
 
 static struct timer *
@@ -201,7 +198,8 @@ timer_create_timer() {
 		}
 	}
 
-	r->lock = 0;
+	SPIN_INIT(r)
+
 	r->current = 0;
 
 	return r;
@@ -209,12 +207,12 @@ timer_create_timer() {
 
 int
 skynet_timeout(uint32_t handle, int time, int session) {
-	if (time == 0) {
+	if (time <= 0) {
 		struct skynet_message message;
 		message.source = 0;
 		message.session = session;
 		message.data = NULL;
-		message.sz = PTYPE_RESPONSE << HANDLE_REMOTE_SHIFT;
+		message.sz = (size_t)PTYPE_RESPONSE << MESSAGE_TYPE_SHIFT;
 
 		if (skynet_context_push(handle, &message)) {
 			return -1;
@@ -249,15 +247,8 @@ static uint64_t
 gettime() {
 	uint64_t t;
 #if !defined(__APPLE__)
-
-#ifdef CLOCK_MONOTONIC_RAW
-#define CLOCK_TIMER CLOCK_MONOTONIC_RAW
-#else
-#define CLOCK_TIMER CLOCK_MONOTONIC
-#endif
-
 	struct timespec ti;
-	clock_gettime(CLOCK_TIMER, &ti);
+	clock_gettime(CLOCK_MONOTONIC, &ti);
 	t = (uint64_t)ti.tv_sec * 100;
 	t += ti.tv_nsec / 10000000;
 #else
@@ -278,13 +269,7 @@ skynet_updatetime(void) {
 	} else if (cp != TI->current_point) {
 		uint32_t diff = (uint32_t)(cp - TI->current_point);
 		TI->current_point = cp;
-
-		uint32_t oc = TI->current;
 		TI->current += diff;
-		if (TI->current < oc) {
-			// when cs > 0xffffffff(about 497 days), time rewind
-			TI->starttime += 0xffffffff / 100;
-		}
 		int i;
 		for (i=0;i<diff;i++) {
 			timer_update(TI);
@@ -293,21 +278,21 @@ skynet_updatetime(void) {
 }
 
 uint32_t
-skynet_gettime_fixsec(void) {
+skynet_starttime(void) {
 	return TI->starttime;
 }
 
-uint32_t 
-skynet_gettime(void) {
+uint64_t 
+skynet_now(void) {
 	return TI->current;
 }
 
 void 
 skynet_timer_init(void) {
 	TI = timer_create_timer();
-	systime(&TI->starttime, &TI->current);
-	uint64_t point = gettime();
-	TI->current_point = point;
-	TI->origin_point = point;
+	uint32_t current = 0;
+	systime(&TI->starttime, &current);
+	TI->current = current;
+	TI->current_point = gettime();
 }
 
